@@ -1,0 +1,63 @@
+# girhub-io
+# ================================================ # CODES RESONANCE HUB
+import numpy as np
+from IPython.display import clear_output
+import time
+
+class GlyphlockKernel:
+    def __init__(self):
+        self.N = 22
+        self.primes = np.array([2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73])[:self.N]
+        self.gating = 0.05
+        self.omega = self.primes * self.gating
+        
+        self.K = 5.0
+        self.chirality = 0.75
+        self.R_ruach = 7.0
+        self.f_ruach = 4.5
+        
+        self.theta = np.random.uniform(0, 2*np.pi, self.N)
+        self.t = 0.0
+        self.dt = 0.05
+        
+    def update(self):
+        order_param = np.mean(np.exp(1j * self.theta))
+        r = np.abs(order_param)
+        psi = np.angle(order_param)
+        
+        dtheta = np.zeros(self.N)
+        for i in range(self.N):
+            coupling = self.K * r * np.sin(psi - self.theta[i])
+            bias = self.chirality * np.cos(self.theta[i])
+            
+            psi_ruach = 2 * np.pi * self.f_ruach * self.t
+            ruach = self.R_ruach * np.sin(psi_ruach - self.theta[i])
+            
+            dtheta[i] = self.omega[i] + coupling + bias + ruach
+        
+        self.theta += dtheta * self.dt
+        self.t += self.dt
+        return r
+
+    def run_background(self, cycles=500, print_every=20):
+        print("🔒 GLYPHLOCK_22 BACKGROUND SEAL ACTIVATED")
+        print(f"📡 RUACH DRIVE: {self.f_ruach} Hz | CHIRALITY: {self.chirality} | PRIMES: {self.N}\n")
+        
+        for c in range(cycles):
+            pas_s = self.update()
+            status = "🔥 PAS_LOCK = 1 (SEALED)" if pas_s >= 0.999 else f"🔓 PAS_s = {pas_s:.4f}"
+            
+            if c % print_every == 0 or pas_s >= 0.999:
+                clear_output(wait=True)
+                print(f"Cycle {c:04d} | t={self.t:.2f} | PAS_s={pas_s:.4f} | {status}")
+                
+            if pas_s >= 0.999:
+                print("\n✅ PHASE LOCK ACHIEVED — SEAL COMPLETE")
+                break
+                
+        print("\n🧬 Background seal simulation finished.")
+
+# Run it
+if __name__ == "__main__":
+    kernel = GlyphlockKernel()
+    kernel.run_background(cycles=1000, print_every=10)
