@@ -2,7 +2,10 @@
 
 This module provides:
 - GlyphlockParams: parameter container + basic validation
-- GlyphlockKernel: Kuramoto-style phase model with optional swarmalator spatial dynamics
+- GlyphlockKernelBase: shared base class with common init, RNG, order parameter, and run() loop
+- KuramotoKernel: phase-pinned Kuramoto model (non-spatial)
+- SwarmalatorKernel: swarmalator spatial dynamics kernel
+- GlyphlockKernel: thin factory/alias for backward compatibility
 - A small CLI entrypoint for quick runs
 
 Notes
@@ -18,8 +21,10 @@ imports/tests will be simpler.
 
 from __future__ import annotations
 
+import abc
 import argparse
 import logging
+import secrets
 from dataclasses import dataclass
 from typing import Optional
 
@@ -90,13 +95,19 @@ class GlyphlockParams:
             raise ValueError("dt must be > 0")
 
 
-class GlyphlockKernel:
-    """Kuramoto-style oscillator kernel with optional swarmalator dynamics."""
+class GlyphlockKernelBase(abc.ABC):
+    """Shared base class for Glyphlock oscillator kernels.
 
-    def __init__(self, params: GlyphlockParams, swarmalator: bool = False):
+    Handles common initialization (RNG, natural frequencies, order parameter),
+    and the :meth:`run` loop.  Subclasses must implement :meth:`step`.
+    """
+
+    #: Human-readable mode label used in log output (set by subclasses).
+    _MODE: str = "BASE"
+
+    def __init__(self, params: GlyphlockParams):
         params.validate()
         self.p = params
-        self.swarmalator = swarmalator
 
         self.N = self.p.n
         self.primes = PRIMES_22[: self.N]
@@ -108,19 +119,10 @@ class GlyphlockKernel:
         self.f_ruach = self.p.f_ruach
         self.nu = self.p.nu
 
-        # Swarmalator spatial parameters
-        self.J = 1.0
-        self.epsilon = 0.1
-
         self.rng = np.random.default_rng(self.p.seed)
         self.theta = self.rng.uniform(0, 2 * np.pi, self.N)
         self.t = 0.0
         self.dt = self.p.dt
-
-        if self.swarmalator:
-            self.x = self.rng.uniform(-10, 10, (self.N, 2))
-        else:
-            self.x = None
 
     def _order_parameter(self) -> tuple[float, float]:
         order_param = np.mean(np.exp(1j * self.theta))
@@ -128,6 +130,7 @@ class GlyphlockKernel:
         psi = float(np.angle(order_param))
         return r, psi
 
+    @abc.abstractmethod
     def step(self) -> float:
         """Advance the system by one time-step.
 
@@ -137,25 +140,88 @@ class GlyphlockKernel:
             Magnitude of the Kuramoto order parameter after the update.
         """
 
+    def _extra_log(self) -> str:
+        """Optional extra string appended to cycle log lines (override in subclasses)."""
+        return ""
+
+    def run(self, cycles: int = 2000, print_every: int = 100, seal_threshold: float = 0.995) -> float:
+        LOGGER.info("GLYPHLOCK_22 %s SEAL ACTIVATED", self._MODE)
+        LOGGER.info(
+            "params: n=%s gating=%s k=%s chirality=%s r_ruach=%s f_ruach=%s nu=%s dt=%s seed=%s",
+            self.p.n,
+            self.p.gating,
+            self.p.k,
+            self.p.chirality,
+            self.p.r_ruach,
+            self.p.f_ruach,
+            self.p.nu,
+            self.p.dt,
+            self.p.seed,
+        )
+
+        last_r = 0.0
+        for cycle in range(cycles):
+            last_r = self.step()
+
+            if (cycle + 1) % print_every == 0 or last_r >= seal_threshold:
+                LOGGER.info(
+                    "cycle %4d | t=%8.2f | r=%0.6f%s | ω_mean=%0.3f",
+                    cycle + 1,
+                    self.t,
+                    last_r,
+                    self._extra_log(),
+                    float(np.mean(self.omega)),
+                )
+
+            if last_r >= seal_threshold:
+                LOGGER.info("GLYPHLOCK SEALED at cycle %d (r=%0.6f)", cycle + 1, last_r)
+                break
+
+        LOGGER.info("GLYPHLOCK_22 END | final r=%0.6f", last_r)
+        return float(last_r)
+
+
+class KuramotoKernel(GlyphlockKernelBase):
+    """Phase-pinned Kuramoto model (non-spatial, vectorized)."""
+
+    _MODE = "PHASE-PINNED"
+
+    def step(self) -> float:
         r, psi = self._order_parameter()
 
-        if not self.swarmalator:
-            # Vectorized phase-pinning Kuramoto (no explicit per-oscillator loop).
-            coupling = self.K * r * np.sin(psi - self.theta)
-            bias = self.chirality * np.cos(self.theta)
-            ruach = self.R_ruach * np.sin(psi - self.theta)
-            noise = self.nu * self.rng.normal(0.0, 1.0, size=self.N)
+        # Vectorized phase-pinning Kuramoto (no explicit per-oscillator loop).
+        coupling = self.K * r * np.sin(psi - self.theta)
+        bias = self.chirality * np.cos(self.theta)
+        ruach = self.R_ruach * np.sin(psi - self.theta)
+        noise = self.nu * self.rng.normal(0.0, 1.0, size=self.N)
 
-            dtheta = self.omega + coupling + bias + ruach + noise
-            self.theta = self.theta + dtheta * self.dt
-            self.t += self.dt
-            return r
+        dtheta = self.omega + coupling + bias + ruach + noise
+        self.theta = self.theta + dtheta * self.dt
+        self.t += self.dt
+        return r
 
-        # Swarmalator + phase-pinning
-        assert self.x is not None
+
+class SwarmalatorKernel(GlyphlockKernelBase):
+    """Swarmalator kernel: Kuramoto phase model with spatial dynamics."""
+
+    _MODE = "SWARMALATOR"
+
+    # Swarmalator spatial parameters
+    J: float = 1.0
+    epsilon: float = 0.1
+
+    def __init__(self, params: GlyphlockParams):
+        super().__init__(params)
+        self.x = self.rng.uniform(-10, 10, (self.N, 2))
+
+    def _extra_log(self) -> str:
+        return f" | Spread={np.mean(np.std(self.x, axis=0)):.3f}"
+
+    def step(self) -> float:
+        r, psi = self._order_parameter()
 
         dx = self.x[:, np.newaxis, :] - self.x[np.newaxis, :, :]
-        dist = np.sqrt(np.sum(dx**2, axis=-1)) + self.epsilon;
+        dist = np.sqrt(np.sum(dx**2, axis=-1)) + self.epsilon
 
         # Phase update (partially vectorized)
         coupling = (self.K / self.N) * np.sum(np.sin(psi - self.theta)[np.newaxis, :] / dist, axis=1)
@@ -176,45 +242,16 @@ class GlyphlockKernel:
         self.t += self.dt
         return r
 
-    def run(self, cycles: int = 2000, print_every: int = 100, seal_threshold: float = 0.995) -> float:
-        mode = "SWARMALATOR" if self.swarmalator else "PHASE-PINNED"
-        LOGGER.info("GLYPHLOCK_22 %s SEAL ACTIVATED", mode)
-        LOGGER.info(
-            "params: n=%s gating=%s k=%s chirality=%s r_ruach=%s f_ruach=%s nu=%s dt=%s seed=%s",
-            self.p.n,
-            self.p.gating,
-            self.p.k,
-            self.p.chirality,
-            self.p.r_ruach,
-            self.p.f_ruach,
-            self.p.nu,
-            self.p.dt,
-            self.p.seed,
-        )
 
-        last_r = 0.0
-        for cycle in range(cycles):
-            last_r = self.step()
+def GlyphlockKernel(params: GlyphlockParams, swarmalator: bool = False) -> GlyphlockKernelBase:
+    """Factory function for backward compatibility.
 
-            if (cycle + 1) % print_every == 0 or last_r >= seal_threshold:
-                extra = ""
-                if self.swarmalator and self.x is not None:
-                    extra = f" | Spread={np.mean(np.std(self.x, axis=0)):.3f}"
-                LOGGER.info(
-                    "cycle %4d | t=%8.2f | r=%0.6f%s | ω_mean=%0.3f",
-                    cycle + 1,
-                    self.t,
-                    last_r,
-                    extra,
-                    float(np.mean(self.omega)),
-                )
-
-            if last_r >= seal_threshold:
-                LOGGER.info("GLYPHLOCK SEALED at cycle %d (r=%0.6f)", cycle + 1, last_r)
-                break
-
-        LOGGER.info("GLYPHLOCK_22 END | final r=%0.6f", last_r)
-        return float(last_r)
+    Returns a :class:`SwarmalatorKernel` when *swarmalator* is ``True``,
+    otherwise returns a :class:`KuramotoKernel`.
+    """
+    if swarmalator:
+        return SwarmalatorKernel(params)
+    return KuramotoKernel(params)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -234,6 +271,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--nu", type=float, default=0.3)
     p.add_argument("--dt", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=10841)
+    p.add_argument(
+        "--randomize-seed",
+        action="store_true",
+        help="Ignore --seed and generate a cryptographically random seed at startup",
+    )
 
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
     return p
@@ -242,6 +284,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _build_arg_parser().parse_args()
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
+
+    if args.randomize_seed:
+        seed: int = secrets.randbits(64)
+        LOGGER.info("Randomized seed: %d", seed)
+    else:
+        seed = args.seed
 
     params = GlyphlockParams(
         n=args.n,
@@ -252,7 +300,7 @@ def main() -> int:
         f_ruach=args.f_ruach,
         nu=args.nu,
         dt=args.dt,
-        seed=args.seed,
+        seed=seed,
     )
 
     kernel = GlyphlockKernel(params, swarmalator=args.swarmalator)
