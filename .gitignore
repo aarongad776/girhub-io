@@ -12,3 +12,7 @@
 
 pkg/
 src/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
