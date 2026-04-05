@@ -31,18 +31,18 @@ import pytest
 
 def _load_glylock() -> types.ModuleType:
     """Load glylock.kernell as a Python module."""
-    mod_name = "glylock_kernell"
+    mod_name = "glylock_kernel"
     if mod_name in sys.modules:
         return sys.modules[mod_name]
 
     import os
-    kernell_path = os.path.join(os.path.dirname(__file__), "glylock.kernell")
+    kernel_path = os.path.join(os.path.dirname(__file__), "glylock.kernell")
     mod = types.ModuleType(mod_name)
-    mod.__file__ = kernell_path
+    mod.__file__ = kernel_path
     sys.modules[mod_name] = mod
-    with open(kernell_path) as fh:
+    with open(kernel_path) as fh:
         src = fh.read()
-    exec(compile(src, kernell_path, "exec"), mod.__dict__)
+    exec(compile(src, kernel_path, "exec"), mod.__dict__)
     return mod
 
 
