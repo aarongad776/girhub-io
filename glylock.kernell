@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -33,6 +33,53 @@ PRIMES_22 = np.array(
     [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79],
     dtype=float,
 )
+
+
+@dataclass
+class GlyphlockProctorReport:
+    """Result of running the suite of proctor validators on a completed run.
+
+    Each boolean flag is ``True`` when that check **passed** (the system looks
+    healthy from that perspective).  ``certified`` is ``True`` only when
+    *every* individual check passes — it is the "certified representation of
+    the order parameter r" that you can trust downstream.
+
+    Attributes
+    ----------
+    r_in_range:
+        Final ``r`` lies in ``[0, 1]``.
+    r_finite:
+        Final ``r`` is a finite (non-NaN, non-inf) float.
+    phases_finite:
+        All oscillator phases are finite at the end of the run.
+    converged:
+        The variance of ``r`` over the last *window* cycles is below
+        ``convergence_tol``.
+    trending_up:
+        The mean of the second half of the run's ``r`` history is strictly
+        greater than the mean of the first half (overall positive trend).
+    certified:
+        All of the above checks passed.
+    final_r:
+        The final order parameter value that was evaluated.
+    r_tail_var:
+        Variance of ``r`` over the last *window* cycles (lower = more stable).
+    window:
+        Number of tail cycles used for the convergence check.
+    convergence_tol:
+        Variance threshold used for the convergence check.
+    """
+
+    r_in_range: bool
+    r_finite: bool
+    phases_finite: bool
+    converged: bool
+    trending_up: bool
+    certified: bool
+    final_r: float
+    r_tail_var: float
+    window: int
+    convergence_tol: float
 
 
 @dataclass(frozen=True)
@@ -59,6 +106,11 @@ class GlyphlockParams:
         Integration time step.
     seed:
         RNG seed for reproducible runs.
+    alpha:
+        Sakaguchi phase lag (radians).  Shifts the coupling term from
+        ``sin(ψ − θ)`` to ``sin(ψ − θ − α)``, modelling synaptic delays,
+        conduction times, or inter-veil friction.  ``alpha=0`` recovers the
+        standard Kuramoto model.
     """
 
     n: int = 22
@@ -70,6 +122,7 @@ class GlyphlockParams:
     nu: float = 0.3
     dt: float = 0.05
     seed: Optional[int] = 10841
+    alpha: float = 0.0
 
     def validate(self) -> None:
         if self.n < 1:
@@ -83,6 +136,7 @@ class GlyphlockParams:
             ("r_ruach", self.r_ruach),
             ("nu", self.nu),
             ("dt", self.dt),
+            ("alpha", self.alpha),
         ):
             if not np.isfinite(value):
                 raise ValueError(f"{name} must be finite")
@@ -107,6 +161,7 @@ class GlyphlockKernel:
         self.R_ruach = self.p.r_ruach
         self.f_ruach = self.p.f_ruach
         self.nu = self.p.nu
+        self.alpha = self.p.alpha
 
         # Swarmalator spatial parameters
         self.J = 1.0
@@ -140,10 +195,10 @@ class GlyphlockKernel:
         r, psi = self._order_parameter()
 
         if not self.swarmalator:
-            # Vectorized phase-pinning Kuramoto (no explicit per-oscillator loop).
-            coupling = self.K * r * np.sin(psi - self.theta)
+            # Vectorized phase-pinning Kuramoto with Sakaguchi lag alpha.
+            coupling = self.K * r * np.sin(psi - self.theta - self.alpha)
             bias = self.chirality * np.cos(self.theta)
-            ruach = self.R_ruach * np.sin(psi - self.theta)
+            ruach = self.R_ruach * np.sin(psi - self.theta - self.alpha)
             noise = self.nu * self.rng.normal(0.0, 1.0, size=self.N)
 
             dtheta = self.omega + coupling + bias + ruach + noise
@@ -157,10 +212,10 @@ class GlyphlockKernel:
         dx = self.x[:, np.newaxis, :] - self.x[np.newaxis, :, :]
         dist = np.sqrt(np.sum(dx**2, axis=-1)) + self.epsilon;
 
-        # Phase update (partially vectorized)
-        coupling = (self.K / self.N) * np.sum(np.sin(psi - self.theta)[np.newaxis, :] / dist, axis=1)
+        # Phase update (partially vectorized) with Sakaguchi lag alpha.
+        coupling = (self.K / self.N) * np.sum(np.sin(psi - self.theta - self.alpha)[np.newaxis, :] / dist, axis=1)
         bias = self.chirality * np.cos(self.theta)
-        ruach = self.R_ruach * np.sin(psi - self.theta)
+        ruach = self.R_ruach * np.sin(psi - self.theta - self.alpha)
         dtheta = self.omega + coupling + bias + ruach
 
         # Spatial update: keep explicit i-loop (clear + correct dimensions)
@@ -176,7 +231,189 @@ class GlyphlockKernel:
         self.t += self.dt
         return r
 
-    def run(self, cycles: int = 2000, print_every: int = 100, seal_threshold: float = 0.995) -> float:
+    def run_proctors(
+        self,
+        r_history: list[float],
+        window: int = 50,
+        convergence_tol: float = 1e-4,
+    ) -> GlyphlockProctorReport:
+        """Run the proctor validator suite and return a certified report.
+
+        Proctors verify that the Kuramoto order parameter ``r`` recorded
+        during a run is trustworthy.  All checks must pass for the report to
+        be **certified**.
+
+        Parameters
+        ----------
+        r_history:
+            List of ``r`` values recorded once per cycle during the run.
+        window:
+            Number of tail cycles to use for the convergence (variance) check.
+        convergence_tol:
+            Maximum variance of ``r`` over the tail window to consider the
+            system converged.
+
+        Returns
+        -------
+        GlyphlockProctorReport
+            Detailed pass/fail breakdown and the ``certified`` flag.
+        """
+        if not r_history:
+            raise ValueError(
+                "run_proctors() requires a non-empty r_history; "
+                "make sure the simulation ran for at least one cycle."
+            )
+        final_r = r_history[-1]
+
+        # --- individual checks -------------------------------------------
+        r_finite = bool(np.isfinite(final_r))
+        r_in_range = r_finite and (0.0 <= final_r <= 1.0)
+        phases_finite = bool(np.all(np.isfinite(self.theta)))
+
+        tail = r_history[-window:]
+        r_tail_var = float(np.var(tail)) if tail else float("nan")
+        # Require the full window to have been observed so a short run cannot
+        # be incorrectly certified as converged.
+        converged = (
+            len(r_history) >= window
+            and np.isfinite(r_tail_var)
+            and r_tail_var <= convergence_tol
+        )
+
+        if len(r_history) >= 2:
+            mid = len(r_history) // 2
+            trending_up = float(np.mean(r_history[mid:])) > float(np.mean(r_history[:mid]))
+        else:
+            trending_up = False
+
+        certified = r_finite and r_in_range and phases_finite and converged and trending_up
+
+        return GlyphlockProctorReport(
+            r_in_range=r_in_range,
+            r_finite=r_finite,
+            phases_finite=phases_finite,
+            converged=converged,
+            trending_up=trending_up,
+            certified=certified,
+            final_r=final_r,
+            r_tail_var=r_tail_var,
+            window=window,
+            convergence_tol=convergence_tol,
+        )
+
+    def detect_regions(
+        self,
+        phase_tol: float = 0.3,
+        spatial_tol: Optional[float] = None,
+    ) -> list[list[int]]:
+        """Automatically detect phase-locked regions among the oscillators.
+
+        Two oscillators are placed in the same region when their wrapped phase
+        difference is within *phase_tol* radians **and** (in swarmalator mode,
+        if *spatial_tol* is given) their Euclidean distance is within
+        *spatial_tol*.
+
+        The algorithm uses a simple union-find on all pairs so that transitively
+        close oscillators end up in the same cluster.
+
+        Parameters
+        ----------
+        phase_tol:
+            Maximum allowed wrapped phase difference (radians) for two
+            oscillators to be considered part of the same region.
+        spatial_tol:
+            Maximum Euclidean distance for two oscillators to be considered
+            co-located (only used in swarmalator mode when ``self.x`` is not
+            ``None``).  Pass ``None`` (default) to ignore spatial proximity.
+
+        Returns
+        -------
+        regions:
+            A list of clusters, each cluster being a sorted list of oscillator
+            indices (0-based).  Oscillators that are not close to any other
+            oscillator appear as singleton clusters.
+        """
+        # --- union-find helpers ------------------------------------------
+        parent = list(range(self.N))
+
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]  # path compression
+                a = parent[a]
+            return a
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # --- pairwise checks ---------------------------------------------
+        # Wrapped phase difference: |Δθ mod 2π| mapped to [0, π]
+        for i in range(self.N):
+            for j in range(i + 1, self.N):
+                delta_phi = abs(self.theta[i] - self.theta[j]) % (2 * np.pi)
+                if delta_phi > np.pi:
+                    delta_phi = 2 * np.pi - delta_phi  # wrap to [0, π]
+
+                if delta_phi > phase_tol:
+                    continue  # phase condition not met
+
+                if spatial_tol is not None and self.x is not None:
+                    dist = float(np.linalg.norm(self.x[i] - self.x[j]))
+                    if dist > spatial_tol:
+                        continue  # spatial condition not met
+
+                union(i, j)
+
+        # --- collect clusters --------------------------------------------
+        clusters: dict[int, list[int]] = {}
+        for i in range(self.N):
+            root = find(i)
+            clusters.setdefault(root, []).append(i)
+
+        regions = sorted(clusters.values(), key=lambda c: c[0])
+        return regions
+
+    def run(
+        self,
+        cycles: int = 2000,
+        print_every: int = 100,
+        seal_threshold: float = 0.995,
+        auto_region: bool = False,
+        region_tol: float = 0.3,
+        enable_proctors: bool = False,
+        proctor_window: int = 50,
+        convergence_tol: float = 1e-4,
+    ) -> float:
+        """Run the simulation for up to *cycles* steps.
+
+        Parameters
+        ----------
+        cycles:
+            Maximum number of integration steps.
+        print_every:
+            Log a status line every this many cycles.
+        seal_threshold:
+            Stop early when the order parameter ``r`` reaches or exceeds this
+            value.
+        auto_region:
+            When ``True``, call :meth:`detect_regions` after the run completes
+            and log the discovered phase-locked clusters.
+        region_tol:
+            Phase tolerance (radians) passed to :meth:`detect_regions`.
+        enable_proctors:
+            When ``True``, run the proctor validator suite after the simulation
+            and log a certified/failed report on the trustworthiness of ``r``.
+        proctor_window:
+            Number of tail cycles used by the convergence proctor.
+        convergence_tol:
+            Variance threshold used by the convergence proctor.
+
+        Returns
+        -------
+        float
+            The final Kuramoto order parameter ``r``.
+        """
         mode = "SWARMALATOR" if self.swarmalator else "PHASE-PINNED"
         LOGGER.info("GLYPHLOCK_22 %s SEAL ACTIVATED", mode)
         LOGGER.info(
@@ -193,8 +430,10 @@ class GlyphlockKernel:
         )
 
         last_r = 0.0
+        r_history: list[float] = []
         for cycle in range(cycles):
             last_r = self.step()
+            r_history.append(last_r)
 
             if (cycle + 1) % print_every == 0 or last_r >= seal_threshold:
                 extra = ""
@@ -214,6 +453,54 @@ class GlyphlockKernel:
                 break
 
         LOGGER.info("GLYPHLOCK_22 END | final r=%0.6f", last_r)
+
+        if auto_region:
+            regions = self.detect_regions(phase_tol=region_tol)
+            LOGGER.info(
+                "AUTO-REGION | %d region(s) detected (phase_tol=%.3f rad)",
+                len(regions),
+                region_tol,
+            )
+            for idx, cluster in enumerate(regions):
+                LOGGER.info("  region %d: oscillators %s", idx, cluster)
+
+        if enable_proctors:
+            report = self.run_proctors(
+                r_history,
+                window=proctor_window,
+                convergence_tol=convergence_tol,
+            )
+            verdict = "CERTIFIED" if report.certified else "FAILED"
+            LOGGER.info(
+                "PROCTOR REPORT [%s] | final_r=%.6f tail_var=%.2e window=%d tol=%.2e",
+                verdict,
+                report.final_r,
+                report.r_tail_var,
+                report.window,
+                report.convergence_tol,
+            )
+            LOGGER.info(
+                "  r_finite=%s  r_in_range=%s  phases_finite=%s  converged=%s  trending_up=%s",
+                report.r_finite,
+                report.r_in_range,
+                report.phases_finite,
+                report.converged,
+                report.trending_up,
+            )
+            if not report.certified:
+                failed = [
+                    name
+                    for name, ok in (
+                        ("r_finite", report.r_finite),
+                        ("r_in_range", report.r_in_range),
+                        ("phases_finite", report.phases_finite),
+                        ("converged", report.converged),
+                        ("trending_up", report.trending_up),
+                    )
+                    if not ok
+                ]
+                LOGGER.warning("PROCTOR FAILED checks: %s", failed)
+
         return float(last_r)
 
 
@@ -234,8 +521,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--nu", type=float, default=0.3)
     p.add_argument("--dt", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=10841)
+    p.add_argument(
+        "--alpha",
+        type=float,
+        default=0.0,
+        help="Sakaguchi phase lag in radians (default: 0.0 = standard Kuramoto)",
+    )
 
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
+    p.add_argument(
+        "--auto-region",
+        action="store_true",
+        help="Detect phase-locked regions automatically after the run",
+    )
+    p.add_argument(
+        "--region-tol",
+        type=float,
+        default=0.3,
+        help="Phase tolerance in radians for region detection (default: 0.3)",
+    )
+    p.add_argument(
+        "--enable-proctors",
+        action="store_true",
+        help="Run proctor validators after the run to certify the order parameter r",
+    )
+    p.add_argument(
+        "--proctor-window",
+        type=int,
+        default=50,
+        help="Number of tail cycles used by the convergence proctor (default: 50)",
+    )
+    p.add_argument(
+        "--convergence-tol",
+        type=float,
+        default=1e-4,
+        help="Variance threshold for the convergence proctor (default: 1e-4)",
+    )
     return p
 
 
@@ -253,10 +574,20 @@ def main() -> int:
         nu=args.nu,
         dt=args.dt,
         seed=args.seed,
+        alpha=args.alpha,
     )
 
     kernel = GlyphlockKernel(params, swarmalator=args.swarmalator)
-    kernel.run(cycles=args.cycles, print_every=args.print_every, seal_threshold=args.seal_threshold)
+    kernel.run(
+        cycles=args.cycles,
+        print_every=args.print_every,
+        seal_threshold=args.seal_threshold,
+        auto_region=args.auto_region,
+        region_tol=args.region_tol,
+        enable_proctors=args.enable_proctors,
+        proctor_window=args.proctor_window,
+        convergence_tol=args.convergence_tol,
+    )
     return 0
 
 
