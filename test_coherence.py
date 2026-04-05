@@ -125,8 +125,16 @@ _TAIL_WINDOW = 50
 _SYNC_THRESHOLD = 0.95
 
 
+def _wrapped_phase_diff(a: float, b: float) -> float:
+    """Return the wrapped phase difference |a − b| mapped to [0, π]."""
+    delta = abs(a - b) % (2 * np.pi)
+    if delta > np.pi:
+        delta = 2 * np.pi - delta
+    return delta
+
+
 def compute_coherence_metrics(
-    kernel: object,
+    kernel: "GlyphlockKernel",  # type: ignore[name-defined]
     cycles: int,
 ) -> CoherenceMetrics:
     """Run *kernel* for *cycles* steps and return a :class:`CoherenceMetrics`.
@@ -161,19 +169,17 @@ def compute_coherence_metrics(
     tail_variance = float(np.var(tail))
 
     # Max pairwise wrapped phase difference
-    phases = kernel.theta  # type: ignore[attr-defined]
+    phases = kernel.theta
     n = len(phases)
     max_pd = 0.0
     for i in range(n):
         for j in range(i + 1, n):
-            delta = abs(phases[i] - phases[j]) % (2 * np.pi)
-            if delta > np.pi:
-                delta = 2 * np.pi - delta
+            delta = _wrapped_phase_diff(float(phases[i]), float(phases[j]))
             if delta > max_pd:
                 max_pd = delta
 
     # Largest cluster percentage via detect_regions
-    regions = kernel.detect_regions(phase_tol=0.3)  # type: ignore[attr-defined]
+    regions = kernel.detect_regions(phase_tol=0.3)
     biggest = max(len(c) for c in regions) if regions else 0
     cluster_pct = biggest / n * 100.0
 
