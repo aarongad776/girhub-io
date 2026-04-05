@@ -134,7 +134,7 @@ def _wrapped_phase_diff(a: float, b: float) -> float:
 
 
 def compute_coherence_metrics(
-    kernel: "GlyphlockKernel",  # type: ignore[name-defined]
+    kernel: GlyphlockKernel,
     cycles: int,
 ) -> CoherenceMetrics:
     """Run *kernel* for *cycles* steps and return a :class:`CoherenceMetrics`.

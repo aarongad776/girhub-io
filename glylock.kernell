@@ -210,7 +210,7 @@ class GlyphlockKernel:
         assert self.x is not None
 
         dx = self.x[:, np.newaxis, :] - self.x[np.newaxis, :, :]
-        dist = np.sqrt(np.sum(dx**2, axis=-1)) + self.epsilon;
+        dist = np.sqrt(np.sum(dx**2, axis=-1)) + self.epsilon
 
         # Phase update (partially vectorized) with Sakaguchi lag alpha.
         coupling = (self.K / self.N) * np.sum(np.sin(psi - self.theta - self.alpha)[np.newaxis, :] / dist, axis=1)
