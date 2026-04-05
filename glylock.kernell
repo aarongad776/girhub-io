@@ -5,7 +5,135 @@ from IPython.display import clear_output
 import time
 
 class GlyphlockKernel:
-    def __init__(self):
+    def __init__(self):import numpy as np
+
+class GlyphlockParams:
+    def __init__(self, n=22, gating=0.05, k=8.0, chirality=0.75,
+                 r_ruach=3.5, f_ruach=4.5, nu=0.3, dt=0.05, seed=10841):
+        self.n = n
+        self.gating = gating
+        self.k = k
+        self.chirality = chirality
+        self.r_ruach = r_ruach
+        self.f_ruach = f_ruach
+        self.nu = nu          # ← noise / inertial / modulation strength
+        self.dt = dt
+        self.seed = seed
+
+class GlyphlockKernel:
+    def __init__(self, params, swarmalator=False):
+        self.p = params
+        self.swarmalator = swarmalator
+        self.N = self.p.n
+        self.primes = np.array([2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79])[:self.N]
+        self.omega = self.primes * self.p.gating
+        
+        self.K = self.p.k
+        self.chirality = self.p.chirality
+        self.R_ruach = self.p.r_ruach
+        self.f_ruach = self.p.f_ruach
+        self.nu = self.p.nu
+        self.J = 1.0
+        self.epsilon = 0.1
+        
+        np.random.seed(self.p.seed)
+        self.theta = np.random.uniform(0, 2*np.pi, self.N)
+        self.t = 0.0
+        self.dt = self.p.dt
+        
+        if self.swarmalator:
+            self.x = np.random.uniform(-10, 10, (self.N, 2))
+    
+    def step(self):
+        order_param = np.mean(np.exp(1j * self.theta))
+        r = np.abs(order_param)
+        psi = np.angle(order_param)
+        
+        if not self.swarmalator:
+            # Pure phase-pinning Kuramoto
+            dtheta = np.zeros(self.N)
+            for i in range(self.N):
+                coupling = self.K * r * np.sin(psi - self.theta[i])
+                bias = self.chirality * np.cos(self.theta[i])
+                ruach = self.R_ruach * np.sin(psi - self.theta[i])
+                # Optional: nu-modulated noise or breath
+                noise = self.nu * np.random.normal(0, 1)
+                dtheta[i] = self.omega[i] + coupling + bias + ruach + noise
+            self.theta += dtheta * self.dt
+            return r
+        
+        else:
+            # Swarmalator + phase-pinning
+            dx = self.x[:, np.newaxis] - self.x[np.newaxis, :]
+            dist = np.sqrt(np.sum(dx**2, axis=-1)) + self.epsilon
+            
+            dtheta = np.zeros(self.N)
+            dx_new = np.zeros((self.N, 2))
+            
+            for i in range(self.N):
+                coupling = (self.K / self.N) * np.sum(np.sin(psi - self.theta) / dist[i])
+                bias = self.chirality * np.cos(self.theta[i])
+                ruach = self.R_ruach * np.sin(psi - self.theta[i])
+                dtheta[i] = self.omega[i] + coupling + bias + ruach
+                
+                # Spatial swarmalator motion
+                unit_vec = dx[i] / dist[i, :, np.newaxis]
+                attraction = (1 + self.J * np.cos(self.theta - self.theta[i]))[:, np.newaxis] * unit_vec
+                repulsion = unit_vec / (dist[i, :, np.newaxis] + self.epsilon)
+                dx_new[i] = np.mean(attraction - repulsion, axis=0)
+            
+            self.theta += dtheta * self.dt
+            self.x += dx_new * self.dt
+            return r
+
+    def run(self, cycles=2000, print_every=100, seal_threshold=0.995):
+        mode = "SWARMALATOR" if self.swarmalator else "PHASE-PINNED"
+        print(f"🔒 GLYPHLOCK_22 {mode} SEAL ACTIVATED")
+        print(
+            "params:",
+            f"n={self.p.n}",
+            f"gating={self.p.gating}",
+            f"k={self.p.k}",
+            f"chirality={self.p.chirality}",
+            f"r_ruach={self.p.r_ruach}",
+            f"f_ruach={self.p.f_ruach}",
+            f"nu={self.p.nu}",
+            f"dt={self.p.dt}",
+            f"seed={self.p.seed}",
+        )
+        print("")
+
+        for cycle in range(cycles):
+            r = self.step()
+
+            if (cycle + 1) % print_every == 0 or r >= seal_threshold:
+                extra = f" | Spread={np.mean(np.std(self.x, axis=0)):.3f}" if self.swarmalator else ""
+                print(
+                    f"  cycle {cycle+1:4d} | t={self.t:8.2f} | r={r:.6f}{extra} | "
+                    f"ω_mean={np.mean(self.omega):.3f}"
+                )
+
+            if r >= seal_threshold:
+                print(f"GLYPHLOCK SEALED at cycle {cycle+1} (r = {r:.6f})")
+                break
+
+        else:
+            print(f"GLYPHLOCK FINISHED {cycles} cycles | final r = {r:.6f}")
+
+        print("GLYPHLOCK_22 END")
+        return r
+
+# ---------------------- Quick Tests ----------------------
+if __name__ == "__main__":
+    params = GlyphlockParams(k=8.0, r_ruach=3.5, nu=0.3, seed=10841)
+    
+    print("=== PHASE-PINNED RUN ===")
+    model_phase = GlyphlockKernel(params, swarmalator=False)
+    final_phase = model_phase.run(cycles=2000, print_every=200, seal_threshold=0.995)
+    
+    print("\n=== SWARMALATOR RUN ===")
+    model_swarm = GlyphlockKernel(params, swarmalator=True)
+    final_swarm = model_swarm.run(cycles=1000, print_every=100, seal_threshold=0.995)
         self.N = 22
         self.primes = np.array([2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73])[:self.N]
         self.gating = 0.05
