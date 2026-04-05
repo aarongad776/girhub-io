@@ -176,7 +176,109 @@ class GlyphlockKernel:
         self.t += self.dt
         return r
 
-    def run(self, cycles: int = 2000, print_every: int = 100, seal_threshold: float = 0.995) -> float:
+    def detect_regions(
+        self,
+        phase_tol: float = 0.3,
+        spatial_tol: Optional[float] = None,
+    ) -> list[list[int]]:
+        """Automatically detect phase-locked regions among the oscillators.
+
+        Two oscillators are placed in the same region when their wrapped phase
+        difference is within *phase_tol* radians **and** (in swarmalator mode,
+        if *spatial_tol* is given) their Euclidean distance is within
+        *spatial_tol*.
+
+        The algorithm uses a simple union-find on all pairs so that transitively
+        close oscillators end up in the same cluster.
+
+        Parameters
+        ----------
+        phase_tol:
+            Maximum allowed wrapped phase difference (radians) for two
+            oscillators to be considered part of the same region.
+        spatial_tol:
+            Maximum Euclidean distance for two oscillators to be considered
+            co-located (only used in swarmalator mode when ``self.x`` is not
+            ``None``).  Pass ``None`` (default) to ignore spatial proximity.
+
+        Returns
+        -------
+        regions:
+            A list of clusters, each cluster being a sorted list of oscillator
+            indices (0-based).  Oscillators that are not close to any other
+            oscillator appear as singleton clusters.
+        """
+        # --- union-find helpers ------------------------------------------
+        parent = list(range(self.N))
+
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]  # path compression
+                a = parent[a]
+            return a
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # --- pairwise checks ---------------------------------------------
+        # Wrapped phase difference: |Δθ mod 2π| mapped to [0, π]
+        for i in range(self.N):
+            for j in range(i + 1, self.N):
+                delta_phi = abs(self.theta[i] - self.theta[j]) % (2 * np.pi)
+                if delta_phi > np.pi:
+                    delta_phi = 2 * np.pi - delta_phi  # wrap to [0, π]
+
+                if delta_phi > phase_tol:
+                    continue  # phase condition not met
+
+                if spatial_tol is not None and self.x is not None:
+                    dist = float(np.linalg.norm(self.x[i] - self.x[j]))
+                    if dist > spatial_tol:
+                        continue  # spatial condition not met
+
+                union(i, j)
+
+        # --- collect clusters --------------------------------------------
+        clusters: dict[int, list[int]] = {}
+        for i in range(self.N):
+            root = find(i)
+            clusters.setdefault(root, []).append(i)
+
+        regions = sorted(clusters.values(), key=lambda c: c[0])
+        return regions
+
+    def run(
+        self,
+        cycles: int = 2000,
+        print_every: int = 100,
+        seal_threshold: float = 0.995,
+        auto_region: bool = False,
+        region_tol: float = 0.3,
+    ) -> float:
+        """Run the simulation for up to *cycles* steps.
+
+        Parameters
+        ----------
+        cycles:
+            Maximum number of integration steps.
+        print_every:
+            Log a status line every this many cycles.
+        seal_threshold:
+            Stop early when the order parameter ``r`` reaches or exceeds this
+            value.
+        auto_region:
+            When ``True``, call :meth:`detect_regions` after the run completes
+            and log the discovered phase-locked clusters.
+        region_tol:
+            Phase tolerance (radians) passed to :meth:`detect_regions`.
+
+        Returns
+        -------
+        float
+            The final Kuramoto order parameter ``r``.
+        """
         mode = "SWARMALATOR" if self.swarmalator else "PHASE-PINNED"
         LOGGER.info("GLYPHLOCK_22 %s SEAL ACTIVATED", mode)
         LOGGER.info(
@@ -214,6 +316,17 @@ class GlyphlockKernel:
                 break
 
         LOGGER.info("GLYPHLOCK_22 END | final r=%0.6f", last_r)
+
+        if auto_region:
+            regions = self.detect_regions(phase_tol=region_tol)
+            LOGGER.info(
+                "AUTO-REGION | %d region(s) detected (phase_tol=%.3f rad)",
+                len(regions),
+                region_tol,
+            )
+            for idx, cluster in enumerate(regions):
+                LOGGER.info("  region %d: oscillators %s", idx, cluster)
+
         return float(last_r)
 
 
@@ -236,6 +349,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=10841)
 
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
+    p.add_argument(
+        "--auto-region",
+        action="store_true",
+        help="Detect phase-locked regions automatically after the run",
+    )
+    p.add_argument(
+        "--region-tol",
+        type=float,
+        default=0.3,
+        help="Phase tolerance in radians for region detection (default: 0.3)",
+    )
     return p
 
 
@@ -256,7 +380,13 @@ def main() -> int:
     )
 
     kernel = GlyphlockKernel(params, swarmalator=args.swarmalator)
-    kernel.run(cycles=args.cycles, print_every=args.print_every, seal_threshold=args.seal_threshold)
+    kernel.run(
+        cycles=args.cycles,
+        print_every=args.print_every,
+        seal_threshold=args.seal_threshold,
+        auto_region=args.auto_region,
+        region_tol=args.region_tol,
+    )
     return 0
 
 
