@@ -1,0 +1,24 @@
+{
+  "name": "girhub-io",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aarongad776/girhub-io.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/aarongad776/girhub-io/issues"
+  },
+  "homepage": "https://github.com/aarongad776/girhub-io#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}
